@@ -7,12 +7,18 @@ const rateLimit = require('express-rate-limit');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+app.set('trust proxy', 1); // ✅ Important for hosting platforms
+
 app.use(cors());
 app.use(express.json());
 
+// Rate Limiter Fix
 const limiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 20,
+  max: 25,
+  standardHeaders: true,
+  legacyHeaders: false,
+  trustProxy: true,
 });
 
 app.use(limiter);
@@ -20,26 +26,30 @@ app.use(limiter);
 const BASE_URL = 'https://pornxnow.me';
 
 const axiosInstance = axios.create({
-  timeout: 15000,           // Increased timeout
+  timeout: 20000, // 20 seconds
   headers: {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     'Accept-Language': 'en-US,en;q=0.9',
     'Referer': BASE_URL,
-    'Connection': 'keep-alive'
+    'Cache-Control': 'no-cache',
   }
 });
 
-// Retry logic
-async function fetchPage(url, retries = 3) {
+// Enhanced fetch with retries
+async function fetchPage(url, retries = 4) {
   for (let i = 0; i < retries; i++) {
     try {
+      console.log(`[Attempt ${i+1}] Fetching: ${url}`);
       const { data } = await axiosInstance.get(url);
       return cheerio.load(data);
     } catch (err) {
-      console.error(`[Attempt ${i+1}] Failed fetching ${url}: ${err.message}`);
+      console.error(`[Attempt ${i+1}] Failed ${url}: ${err.message}`);
       if (i === retries - 1) throw err;
-      await new Promise(res => setTimeout(res, 1500 * (i + 1))); // Backoff
+      
+      // Progressive backoff
+      const delay = 2000 * (i + 1);
+      await new Promise(r => setTimeout(r, delay));
     }
   }
 }
@@ -47,37 +57,32 @@ async function fetchPage(url, retries = 3) {
 // Routes
 app.get('/', (req, res) => {
   res.json({
-    message: "PornXnow.me API (Improved)",
+    message: "PornXnow.me API - Fixed",
     status: "Running",
-    note: "Timeouts were fixed with retries + better headers"
+    fixes: ["trust proxy enabled", "better retries", "20s timeout"]
   });
 });
 
 app.get('/videos', async (req, res) => {
   try {
-    const page = req.query.page || 1;
+    const page = parseInt(req.query.page) || 1;
     const $ = await fetchPage(`${BASE_URL}/page/${page}`);
 
     const videos = [];
-    $('.video-block').each((i, el) => {
-      const titleEl = $(el).find('.title');
-      const thumbEl = $(el).find('img');
-      const durationEl = $(el).find('.duration');
-      const viewsEl = $(el).find('.views-number');
-
-      const title = titleEl.text().trim();
-      const link = titleEl.closest('a').attr('href') || $(el).find('a.thumb').attr('href');
-      const thumbnail = thumbEl.attr('data-src') || thumbEl.attr('src');
-      const duration = durationEl.text().trim();
-      const views = viewsEl.text().trim();
+    $('.video-block').each((_, el) => {
+      const title = $(el).find('.title').text().trim();
+      const link = $(el).find('a.thumb').attr('href') || $(el).find('.infos a').attr('href');
+      const thumbnail = $(el).find('img').attr('data-src') || $(el).find('img').attr('src');
+      const duration = $(el).find('.duration').text().trim();
+      const views = $(el).find('.views-number').text().trim();
 
       if (title && link) {
         videos.push({
           title,
           slug: link.split('/').filter(Boolean).pop(),
           url: link.startsWith('http') ? link : BASE_URL + link,
-          thumbnail,
-          duration,
+          thumbnail: thumbnail?.startsWith('http') ? thumbnail : BASE_URL + thumbnail,
+          duration: duration || 'N/A',
           views: views || 'N/A'
         });
       }
@@ -85,7 +90,7 @@ app.get('/videos', async (req, res) => {
 
     res.json({
       success: true,
-      page: parseInt(page),
+      page,
       count: videos.length,
       videos
     });
@@ -101,7 +106,7 @@ app.get('/videos', async (req, res) => {
 app.get('/search', async (req, res) => {
   try {
     const q = req.query.q;
-    if (!q) return res.status(400).json({ error: "Missing ?q= parameter" });
+    if (!q) return res.status(400).json({ error: "Missing ?q=" });
 
     const $ = await fetchPage(`${BASE_URL}/?s=${encodeURIComponent(q)}`);
 
@@ -109,15 +114,15 @@ app.get('/search', async (req, res) => {
     $('.video-block').each((_, el) => {
       const title = $(el).find('.title').text().trim();
       const link = $(el).find('a.thumb').attr('href');
-      const thumb = $(el).find('img').attr('data-src') || $(el).find('img').attr('src');
+      const thumbnail = $(el).find('img').attr('data-src') || $(el).find('img').attr('src');
       const duration = $(el).find('.duration').text().trim();
 
-      if (title) {
+      if (title && link) {
         videos.push({
           title,
           slug: link.split('/').filter(Boolean).pop(),
           url: link.startsWith('http') ? link : BASE_URL + link,
-          thumbnail: thumb,
+          thumbnail,
           duration
         });
       }
@@ -132,20 +137,20 @@ app.get('/search', async (req, res) => {
 app.get('/video/:slug', async (req, res) => {
   try {
     const slug = req.params.slug;
-    const $ = await fetchPage(`${BASE_URL}/${slug}/`);
+    const $ = await fetchPage(`${BASE_URL}/${slug}`);
 
-    const title = $('h1').first().text().trim() || $('.infos .title').first().text().trim();
+    const title = $('h1').first().text().trim() || $('.title').first().text().trim();
     const thumbnail = $('meta[property="og:image"]').attr('content') || $('.video-img').attr('src');
     const duration = $('.duration').text().trim();
     const views = $('.views-number').text().trim();
-    const embed = $('iframe').attr('src') || null;
+    const embed = $('iframe').attr('src');
 
     res.json({
       success: true,
-      title,
+      title: title || 'Untitled',
       thumbnail,
-      duration,
-      views,
+      duration: duration || 'N/A',
+      views: views || 'N/A',
       embed,
       originalUrl: `${BASE_URL}/${slug}`
     });
@@ -155,5 +160,6 @@ app.get('/video/:slug', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 PornXnow API v2 running on http://localhost:${PORT}`);
+  console.log(`🚀 PornXnow API v3 running on port ${PORT}`);
+  console.log(`✅ trust proxy enabled | Better retries active`);
 });
